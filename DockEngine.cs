@@ -12,6 +12,7 @@ namespace TaskbarDock {
             public int LastRight = -9999;
             public int LastTop = -9999;
             public int LastBottom = -9999;
+            public int LastTrayTop = -9999;
             public int LastTrayNotifyLeft = -9999;
             public int LastTrayNotifyRight = -9999;
             public int LastMode = -1;
@@ -26,6 +27,7 @@ namespace TaskbarDock {
                 LastRight = -9999;
                 LastTop = -9999;
                 LastBottom = -9999;
+                LastTrayTop = -9999;
                 LastTrayNotifyLeft = -9999;
                 LastTrayNotifyRight = -9999;
                 LastMode = -1;
@@ -485,6 +487,10 @@ namespace TaskbarDock {
                 state.LastHasButton == config.ShowQuickSettingsButton &&
                 state.LastTrayNotifyLeft == notifyLeft &&
                 state.LastTrayNotifyRight == notifyRight) {
+                if (isPrimary && state.LastTrayTop != trayRect.Top) {
+                    state.LastTrayTop = trayRect.Top;
+                    UpdateOverlayPos(trayRect.Left + rLeft, trayRect.Top + rTop, trayRect.Left + rRight, trayRect.Top + rBottom, config);
+                }
                 return;
             }
 
@@ -536,6 +542,7 @@ namespace TaskbarDock {
             state.LastRight = rRight;
             state.LastTop = rTop;
             state.LastBottom = rBottom;
+            state.LastTrayTop = trayRect.Top;
             state.LastMode = config.Mode;
             state.LastRadius = config.CornerRadius;
             state.LastOpacity = config.TaskbarOpacity;
