@@ -55,6 +55,7 @@ namespace TaskbarDock {
 
         private bool _isFullscreenHidden = false;
         private bool _isHoverRevealed = false;
+        private bool _isSystemAutoHide = false;
         private NativeMethods.RECT _originalWorkArea;
         private bool _workAreaModified = false;
 
@@ -185,11 +186,24 @@ namespace TaskbarDock {
             IntPtr primaryTray = NativeMethods.FindWindow("Shell_TrayWnd", null);
             if (primaryTray == IntPtr.Zero) return;
 
-            // 1. Float Over Windows (Work Area Management) - must run even when dock is auto-hidden!
-            UpdateWorkArea(config.FloatOverWindows, config);
+            // 1. Auto-Hide when foreground window is maximized/fullscreen, reveal on bottom screen edge hover
+            bool isFullOrMax = config.AutoHideInFullscreen && IsForegroundFullscreenOrMaximized();
 
-            // 2. Auto-Hide when foreground window is maximized/fullscreen, reveal on bottom screen edge hover
-            if (config.AutoHideInFullscreen && IsForegroundFullscreenOrMaximized()) {
+            // Enable system ABS_AUTOHIDE only when a window is maximized/fullscreen so it can occupy the full 1080p screen;
+            // keep ABS_ALWAYSONTOP otherwise so the dock is always visible when no window is maximized!
+            if (config.FloatOverWindows && isFullOrMax) {
+                if (!_isSystemAutoHide) {
+                    SetSystemTaskbarAutoHide(true);
+                    _isSystemAutoHide = true;
+                }
+            } else {
+                if (_isSystemAutoHide) {
+                    SetSystemTaskbarAutoHide(false);
+                    _isSystemAutoHide = false;
+                }
+            }
+
+            if (isFullOrMax) {
                 NativeMethods.POINT pt;
                 int sh = Screen.PrimaryScreen.Bounds.Height;
                 if (NativeMethods.GetCursorPos(out pt)) {
