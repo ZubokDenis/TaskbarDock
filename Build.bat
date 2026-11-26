@@ -8,7 +8,7 @@ if not exist "%CSC%" (
     exit /b 1
 )
 
-"%CSC%" /nologo /target:winexe /win32icon:app.ico /lib:C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF /r:System.dll,System.Drawing.dll,System.Windows.Forms.dll,UIAutomationClient.dll,UIAutomationTypes.dll,WindowsBase.dll /out:TaskbarDock.exe NativeMethods.cs Config.cs Logger.cs DockOverlayWindow.cs DockEngine.cs SettingsForm.cs Program.cs
+"%CSC%" /nologo /target:winexe /win32icon:app.ico /lib:C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF /r:System.dll,System.Drawing.dll,System.Windows.Forms.dll,UIAutomationClient.dll,UIAutomationTypes.dll,WindowsBase.dll,PresentationCore.dll,PresentationFramework.dll,System.Xaml.dll /out:TaskbarDock.exe NativeMethods.cs Config.cs Logger.cs SystemControllers.cs DockFlyoutWindow.cs DockTrayBarWindow.cs DockOverlayWindow.cs DockEngine.cs SettingsForm.cs Program.cs
 
 if %ERRORLEVEL% equ 0 (
     echo.

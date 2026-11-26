@@ -1,7 +1,9 @@
 using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Threading;
 using System.Windows.Forms;
+using System.Windows.Threading;
 
 namespace TaskbarDock {
     /// <summary>
@@ -15,7 +17,26 @@ namespace TaskbarDock {
         private bool _regionSet = false;
         private int _baseBtnX = 0;
         private int _baseBtnY = 0;
+        private int _dockLeft = 0;
+        private int _dockTop = 0;
+        private int _dockRight = 0;
+        private int _dockBottom = 0;
+        private DockTrayBarWindow _trayBar;
+        private Thread _wpfThread;
+        private Dispatcher _wpfDispatcher;
         private const int BtnSize = 26;
+
+        public bool IsTrayBarOpen {
+            get { return _trayBar != null && _trayBar.IsOpenVolatile; }
+        }
+
+        public IntPtr TrayBarHandle {
+            get { return _trayBar != null ? _trayBar.HwndVolatile : IntPtr.Zero; }
+        }
+
+        public IntPtr TrayFlyoutHandle {
+            get { return _trayBar != null ? _trayBar.FlyoutHwndVolatile : IntPtr.Zero; }
+        }
 
         protected override CreateParams CreateParams {
             get {
@@ -54,20 +75,55 @@ namespace TaskbarDock {
                 if (_isPressed) {
                     _isPressed = false;
                     this.Invalidate();
-                    ShowMenu();
+                    ToggleTrayBar();
                 }
             };
             this.DoubleClick += (s, e) => {
+                HideTrayBar();
                 if (_onOpenSettings != null) _onOpenSettings();
             };
+            this.VisibleChanged += (s, e) => {
+                if (!this.Visible) HideTrayBar();
+            };
+
+            StartWpfTrayThread();
+        }
+
+        private void StartWpfTrayThread() {
+            ManualResetEvent ready = new ManualResetEvent(false);
+            _wpfThread = new Thread(() => {
+                try {
+                    IntPtr hDesk = NativeMethods.OpenDesktop("Default", 0, false, 0x01FF);
+                    if (hDesk != IntPtr.Zero) NativeMethods.SetThreadDesktop(hDesk);
+                    _wpfDispatcher = Dispatcher.CurrentDispatcher;
+                    _trayBar = new DockTrayBarWindow(_config, _onOpenSettings);
+                    _trayBar.EnsurePrewarmed();
+                    ready.Set();
+                    Dispatcher.Run();
+                } catch (Exception ex) {
+                    Logger.Log("WpfTrayThread error: " + ex.Message);
+                    ready.Set();
+                }
+            });
+            _wpfThread.SetApartmentState(ApartmentState.STA);
+            _wpfThread.IsBackground = true;
+            _wpfThread.Name = "DockTrayBarWpfThread";
+            _wpfThread.Start();
+            ready.WaitOne(2000);
         }
 
         public void UpdateOverlay(int left, int top, int right, int bottom, Config config, double targetOpacity = 1.0) {
             _config = config;
             if (!_config.ShowQuickSettingsButton || !_config.Enabled) {
+                HideTrayBar();
                 if (this.Visible) this.Hide();
                 return;
             }
+
+            _dockLeft = left;
+            _dockTop = top;
+            _dockRight = right;
+            _dockBottom = bottom;
 
             int visualMargin = Math.Max(12, _config.PaddingHorizontal);
             int btnX = right - visualMargin - BtnSize;
@@ -91,6 +147,14 @@ namespace TaskbarDock {
 
             NativeMethods.SetWindowPos(this.Handle, NativeMethods.HWND_TOPMOST, btnX, btnY, BtnSize, BtnSize, NativeMethods.SWP_NOACTIVATE | NativeMethods.SWP_SHOWWINDOW);
             this.Invalidate();
+
+            if (_trayBar != null && _trayBar.IsOpenVolatile && _wpfDispatcher != null) {
+                int dl = _dockLeft, dt = _dockTop, dr = _dockRight, db = _dockBottom;
+                Config cfg = _config;
+                _wpfDispatcher.BeginInvoke(new Action(() => {
+                    if (_trayBar != null) _trayBar.UpdateDockAnchor(dl, dt, dr, db, cfg);
+                }));
+            }
         }
 
         public void EnsureTopMost() {
@@ -174,23 +238,43 @@ namespace TaskbarDock {
             NativeMethods.keybd_event(NativeMethods.VK_RETURN, 0, NativeMethods.KEYEVENTF_KEYUP, UIntPtr.Zero);
         }
 
-        private void ShowMenu() {
-            ContextMenu menu = new ContextMenu();
-            menu.MenuItems.Add("⚙  Настройки TaskbarDock...", (s, e) => {
-                if (_onOpenSettings != null) _onOpenSettings();
-            });
-            menu.MenuItems.Add("-");
-            menu.MenuItems.Add("🔊  Быстрые настройки (Звук, Wi-Fi, Батарея) [Win+A]", (s, e) => TriggerQuickSettings());
-            menu.MenuItems.Add("🔔  Центр уведомлений и календарь [Win+N]", (s, e) => TriggerNotificationCenter());
-            menu.MenuItems.Add("🔺  Скрытые значки трея [Win+B]", (s, e) => TriggerTrayOverflow());
-            menu.MenuItems.Add("-");
-            menu.MenuItems.Add("✖  Восстановить панель задач", (s, e) => {
-                _config.Enabled = false;
-                _config.Save();
-            });
+        private void ToggleTrayBar() {
+            if (_trayBar == null || _wpfDispatcher == null) return;
+            int dl = _dockLeft, dt = _dockTop, dr = _dockRight, db = _dockBottom;
+            Config cfg = _config;
+            _wpfDispatcher.BeginInvoke(new Action(() => {
+                if (_trayBar == null) return;
+                if (_trayBar.IsVisible && _trayBar.IsOpenVolatile) {
+                    _trayBar.HideBar(immediate: false);
+                    return;
+                }
+                long now = Environment.TickCount & 0x7FFFFFFF;
+                long sinceClosed = (now - _trayBar.LastClosedTick) & 0x7FFFFFFF;
+                if (_trayBar.LastClosedTick != 0 && sinceClosed < 250) {
+                    return;
+                }
+                _trayBar.ShowAboveDock(dl, dt, dr, db, cfg);
+            }));
+        }
 
-            NativeMethods.SetForegroundWindow(this.Handle);
-            menu.Show(this, new Point(0, -menu.MenuItems.Count * 22));
+        public void HideTrayBar() {
+            if (_trayBar != null && _wpfDispatcher != null && !_wpfDispatcher.HasShutdownStarted) {
+                _wpfDispatcher.BeginInvoke(new Action(() => {
+                    if (_trayBar != null) _trayBar.HideBar(immediate: true);
+                }));
+            }
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e) {
+            if (_wpfDispatcher != null && !_wpfDispatcher.HasShutdownStarted) {
+                try {
+                    _wpfDispatcher.BeginInvoke(new Action(() => {
+                        if (_trayBar != null) _trayBar.Close();
+                    }));
+                    _wpfDispatcher.BeginInvokeShutdown(DispatcherPriority.Normal);
+                } catch { }
+            }
+            base.OnFormClosing(e);
         }
     }
 }

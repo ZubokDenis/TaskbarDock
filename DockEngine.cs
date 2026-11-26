@@ -212,6 +212,9 @@ namespace TaskbarDock {
             // 2. Auto-Hide when foreground window is maximized/fullscreen, reveal on bottom screen edge hover
             bool isShellDockActive = false;
             bool isFullOrMax = config.AutoHideInFullscreen && IsForegroundFullscreenOrMaximized(out isShellDockActive);
+            if (_overlay != null && !_overlay.IsDisposed && _overlay.IsTrayBarOpen) {
+                isShellDockActive = true;
+            }
 
             if (isFullOrMax) {
                 var pb = Screen.PrimaryScreen.Bounds;
@@ -305,7 +308,13 @@ namespace TaskbarDock {
         }
 
         private bool IsShellOrDockWindow(IntPtr hwnd, string cls) {
-            if (_overlay != null && !_overlay.IsDisposed && hwnd == _overlay.Handle) return true;
+            if (_overlay != null && !_overlay.IsDisposed) {
+                if (hwnd == _overlay.Handle) return true;
+                IntPtr barH = _overlay.TrayBarHandle;
+                if (barH != IntPtr.Zero && hwnd == barH) return true;
+                IntPtr flyH = _overlay.TrayFlyoutHandle;
+                if (flyH != IntPtr.Zero && hwnd == flyH) return true;
+            }
             return cls == "Shell_TrayWnd" ||
                    cls == "Shell_SecondaryTrayWnd" ||
                    cls == "NotifyIconOverflowWindow" ||

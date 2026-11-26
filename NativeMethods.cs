@@ -125,6 +125,15 @@ namespace TaskbarDock {
         [DllImport("user32.dll")]
         public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetKeyboardLayout(uint idThread);
+
+        [DllImport("user32.dll")]
+        public static extern int GetKeyboardLayoutList(int nBuff, [Out] IntPtr[] lpList);
+
         // Layered window update
         [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
         public static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, ref POINT pptDst, ref SIZE psize, IntPtr hdcSrc, ref POINT pptSrc, uint crKey, [In] ref BLENDFUNCTION pblend, uint dwFlags);
@@ -169,6 +178,8 @@ namespace TaskbarDock {
         public const uint MOD_NOREPEAT = 0x4000;
 
         public const int WM_HOTKEY = 0x0312;
+        public const int WM_ACTIVATE = 0x0006;
+        public const int WM_INPUTLANGCHANGEREQUEST = 0x0050;
         public const int WM_ENDSESSION = 0x0016;
         public const int WM_QUERYENDSESSION = 0x0011;
         public const int WM_NCHITTEST = 0x0084;
@@ -208,8 +219,12 @@ namespace TaskbarDock {
         public const byte VK_A = 0x41;
         public const byte VK_N = 0x4E;
         public const byte VK_B = 0x42;
+        public const byte VK_SPACE = 0x20;
         public const byte VK_RETURN = 0x0D;
         public const byte VK_ESCAPE = 0x1B;
+        public const byte VK_VOLUME_MUTE = 0xAD;
+        public const byte VK_VOLUME_DOWN = 0xAE;
+        public const byte VK_VOLUME_UP = 0xAF;
         public const uint KEYEVENTF_KEYUP = 0x0002;
 
         public const int HTTRANSPARENT = -1;
