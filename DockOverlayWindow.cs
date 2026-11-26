@@ -62,7 +62,7 @@ namespace TaskbarDock {
             };
         }
 
-        public void UpdateOverlay(int left, int top, int right, int bottom, Config config) {
+        public void UpdateOverlay(int left, int top, int right, int bottom, Config config, double targetOpacity = 1.0) {
             _config = config;
             if (!_config.ShowQuickSettingsButton || !_config.Enabled) {
                 if (this.Visible) this.Hide();
@@ -77,6 +77,7 @@ namespace TaskbarDock {
 
             this.Location = new Point(btnX, btnY);
             this.Size = new Size(BtnSize, BtnSize);
+            this.Opacity = Math.Max(0.0, Math.Min(1.0, targetOpacity));
 
             if (!_regionSet) {
                 IntPtr rgn = NativeMethods.CreateRoundRectRgn(0, 0, BtnSize + 1, BtnSize + 1, BtnSize + 1, BtnSize + 1);
@@ -90,6 +91,11 @@ namespace TaskbarDock {
 
             NativeMethods.SetWindowPos(this.Handle, NativeMethods.HWND_TOPMOST, btnX, btnY, BtnSize, BtnSize, NativeMethods.SWP_NOACTIVATE | NativeMethods.SWP_SHOWWINDOW);
             this.Invalidate();
+        }
+
+        public void EnsureTopMost() {
+            if (!this.Visible) return;
+            NativeMethods.SetWindowPos(this.Handle, NativeMethods.HWND_TOPMOST, 0, 0, 0, 0, NativeMethods.SWP_NOMOVE | NativeMethods.SWP_NOSIZE | NativeMethods.SWP_NOACTIVATE);
         }
 
         public void SetVerticalOffset(int offsetY) {

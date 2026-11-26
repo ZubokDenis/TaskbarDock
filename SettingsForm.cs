@@ -331,7 +331,7 @@ namespace TaskbarDock {
             _config.PaddingHorizontal = 16;
             _config.MarginBottom = 4;
             _config.MarginTop = 4;
-            _config.FloatOverWindows = false;
+            _config.FloatOverWindows = true;
             _config.AutoHideInFullscreen = true;
             _config.ShowQuickSettingsButton = true;
             _config.Enabled = true;
