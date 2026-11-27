@@ -22,6 +22,32 @@ namespace TaskbarDock {
             public bool LastHasButton = false;
             public bool IsCustomRgnApplied = false;
 
+            public bool IsFullscreenHidden = false;
+            public bool IsHoverRevealed = false;
+            public long LastInDockZoneTick = 0;
+
+            public bool HasCachedBounds = false;
+            public int CachedLeft = -9999;
+            public int CachedRight = -9999;
+            public int CachedTop = -9999;
+            public int CachedBottom = -9999;
+            public int CachedTrayTop = -9999;
+            public int CachedNotifyLeft = -1;
+            public int CachedNotifyRight = -1;
+
+            public void SaveCache() {
+                if (IsCustomRgnApplied && LastRight > LastLeft && LastBottom > LastTop) {
+                    HasCachedBounds = true;
+                    CachedLeft = LastLeft;
+                    CachedRight = LastRight;
+                    CachedTop = LastTop;
+                    CachedBottom = LastBottom;
+                    CachedTrayTop = LastTrayTop;
+                    CachedNotifyLeft = LastTrayNotifyLeft;
+                    CachedNotifyRight = LastTrayNotifyRight;
+                }
+            }
+
             public void Reset() {
                 LastLeft = -9999;
                 LastRight = -9999;
@@ -56,9 +82,12 @@ namespace TaskbarDock {
         private bool _isFullscreenHidden = false;
         private bool _isHoverRevealed = false;
         private bool _lastWindowFullscreen = false;
+        private bool _isSearchOpen = false;
+        private volatile bool _anySecondaryFullscreenOrHover = false;
+        private IntPtr _lastLoggedSearchHwnd = IntPtr.Zero;
         private long _lastInDockZoneTick = 0;
         private long _lastWorkAreaEnforceTick = 0;
-        private NativeMethods.RECT _originalWorkArea;
+        private Dictionary<string, NativeMethods.RECT> _originalWorkAreas = new Dictionary<string, NativeMethods.RECT>();
         private bool _workAreaModified = false;
 
         public DockEngine(Action onOpenSettings = null) {
@@ -66,10 +95,9 @@ namespace TaskbarDock {
             SaveOriginalWorkArea();
         }
 
-        private void SaveOriginalWorkArea() {
+        private int GetFallbackTrayHeight() {
+            int fallbackTrayH = 48;
             try {
-                var pb = System.Windows.Forms.Screen.PrimaryScreen.Bounds;
-                int fallbackTrayH = 48;
                 IntPtr tray = NativeMethods.FindWindow("Shell_TrayWnd", null);
                 if (tray != IntPtr.Zero) {
                     NativeMethods.RECT tr;
@@ -77,16 +105,23 @@ namespace TaskbarDock {
                         fallbackTrayH = tr.Height;
                     }
                 }
+            } catch { }
+            return fallbackTrayH;
+        }
 
-                NativeMethods.RECT curWork = new NativeMethods.RECT();
-                if (NativeMethods.SystemParametersInfo(NativeMethods.SPI_GETWORKAREA, 0, ref curWork, 0)) {
-                    bool isFullBounds = (curWork.Left <= pb.Left && curWork.Top <= pb.Top && curWork.Right >= pb.Right && curWork.Bottom >= pb.Bottom);
+        private void SaveOriginalWorkArea() {
+            try {
+                int fallbackTrayH = GetFallbackTrayHeight();
+                foreach (var screen in Screen.AllScreens) {
+                    var sb = screen.Bounds;
+                    var wa = screen.WorkingArea;
+                    bool isFullBounds = (wa.Left <= sb.Left && wa.Top <= sb.Top && wa.Right >= sb.Right && wa.Bottom >= sb.Bottom);
                     if (!isFullBounds) {
-                        _originalWorkArea = curWork;
-                        return;
+                        _originalWorkAreas[screen.DeviceName] = new NativeMethods.RECT(wa.Left, wa.Top, wa.Right, wa.Bottom);
+                    } else if (!_originalWorkAreas.ContainsKey(screen.DeviceName)) {
+                        _originalWorkAreas[screen.DeviceName] = new NativeMethods.RECT(sb.Left, sb.Top, sb.Right, sb.Bottom - fallbackTrayH);
                     }
                 }
-                _originalWorkArea = new NativeMethods.RECT(pb.Left, pb.Top, pb.Right, pb.Bottom - fallbackTrayH);
             } catch { }
         }
 
@@ -184,8 +219,8 @@ namespace TaskbarDock {
                 if (_config != null && _config.PollIntervalMs >= 50) {
                     interval = _config.PollIntervalMs;
                 }
-                if (_config != null && _config.Enabled && _config.AutoHideInFullscreen &&
-                    (_lastWindowFullscreen || _isFullscreenHidden || _isHoverRevealed)) {
+                if (_config != null && _config.Enabled &&
+                    (_isSearchOpen || (_config.AutoHideInFullscreen && (_lastWindowFullscreen || _isFullscreenHidden || _isHoverRevealed || _anySecondaryFullscreenOrHover)))) {
                     interval = Math.Min(interval, 50);
                 }
                 _wakeEvent.WaitOne(interval);
@@ -211,7 +246,13 @@ namespace TaskbarDock {
 
             // 2. Auto-Hide when foreground window is maximized/fullscreen, reveal on bottom screen edge hover
             bool isShellDockActive = false;
-            bool isFullOrMax = config.AutoHideInFullscreen && IsForegroundFullscreenOrMaximized(out isShellDockActive);
+            bool isStartOrSearchOpen = false;
+            IntPtr searchHwnd = IntPtr.Zero;
+            bool isFullOrMax = config.AutoHideInFullscreen && IsForegroundFullscreenOrMaximized(primaryTray, out isShellDockActive, out isStartOrSearchOpen, out searchHwnd);
+            if (!config.AutoHideInFullscreen) {
+                DetectSearchForeground(out searchHwnd);
+            }
+            _isSearchOpen = (searchHwnd != IntPtr.Zero);
             if (_overlay != null && !_overlay.IsDisposed && _overlay.IsTrayBarOpen) {
                 isShellDockActive = true;
             }
@@ -232,7 +273,11 @@ namespace TaskbarDock {
 
                 long now = Environment.TickCount & 0x7FFFFFFF;
                 NativeMethods.POINT pt;
-                if (NativeMethods.GetCursorPos(out pt)) {
+                if (isStartOrSearchOpen) {
+                    if (!_isHoverRevealed) Logger.Log("Revealing dock for Start Menu / Search.");
+                    _isHoverRevealed = true;
+                    _lastInDockZoneTick = now;
+                } else if (NativeMethods.GetCursorPos(out pt)) {
                     bool inPrimaryX = (pt.X >= pb.Left && pt.X < pb.Right);
                     bool atBottomEdge = inPrimaryX && pt.Y >= pb.Bottom - 5 && pt.Y <= pb.Bottom;
                     bool inDockZone = inPrimaryX && pt.Y >= dockTop - 16 && pt.Y <= pb.Bottom;
@@ -257,42 +302,63 @@ namespace TaskbarDock {
                 if (!_isHoverRevealed) {
                     if (!_isFullscreenHidden) {
                         Logger.Log("Hiding dock (foreground window is fullscreen/maximized).");
-                        AnimateDock(primaryTray, config, show: false);
+                        _mainTrayState.SaveCache();
+                        AnimateDock(primaryTray, _mainTrayState, config, true, show: false);
                         HidePrimaryTrayVisuals(primaryTray);
                         HideOverlay();
                         _isFullscreenHidden = true;
                     }
+                    UpdateSecondaryTaskbars(config);
                     return;
                 } else if (_isFullscreenHidden) {
-                    Logger.Log("Revealing dock on bottom-edge hover.");
-                    _isFullscreenHidden = false;
-                    _mainTrayState.Reset();
-                    NativeMethods.SetLayeredWindowAttributes(primaryTray, 0, 0, NativeMethods.LWA_ALPHA);
-                    EnsureTaskbarZOrder(primaryTray, config, forceTopMost: true);
-                    UpdateSingleTaskbar(primaryTray, _mainTrayState, config, isPrimary: true, initialAlpha: 0);
-                    AnimateDock(primaryTray, config, show: true);
+                    Logger.Log("Revealing dock immediately.");
+                    RevealPrimaryDockFast(primaryTray, config);
                 }
             } else {
                 _isHoverRevealed = false;
                 if (_isFullscreenHidden) {
                     Logger.Log("Restoring dock (no foreground fullscreen/maximized window).");
-                    _isFullscreenHidden = false;
-                    _mainTrayState.Reset();
-                    NativeMethods.SetLayeredWindowAttributes(primaryTray, 0, 0, NativeMethods.LWA_ALPHA);
-                    EnsureTaskbarZOrder(primaryTray, config, forceTopMost: true);
-                    UpdateSingleTaskbar(primaryTray, _mainTrayState, config, isPrimary: true, initialAlpha: 0);
-                    AnimateDock(primaryTray, config, show: true);
+                    RevealPrimaryDockFast(primaryTray, config);
                 }
             }
 
             // 3. Z-order management: keep dock above normal and fullscreen windows when visible
             EnsureTaskbarZOrder(primaryTray, config, forceTopMost: false);
 
+            // 3b. Keep Windows Search flyout positioned cleanly above the dock (like Start Menu)
+            if (searchHwnd != IntPtr.Zero) {
+                AdjustSearchWindowAboveDock(searchHwnd, primaryTray, config);
+            }
+
             // 4. Update Primary Taskbar & Glass Overlay
             UpdateSingleTaskbar(primaryTray, _mainTrayState, config, isPrimary: true);
 
             // 5. Update Secondary Taskbars
             UpdateSecondaryTaskbars(config);
+        }
+
+        private void RevealPrimaryDockFast(IntPtr primaryTray, Config config) {
+            _isFullscreenHidden = false;
+            _mainTrayState.Reset();
+            NativeMethods.SetLayeredWindowAttributes(primaryTray, 0, 0, NativeMethods.LWA_ALPHA);
+            EnsureTaskbarZOrder(primaryTray, config, forceTopMost: true);
+
+            if (_mainTrayState.HasCachedBounds) {
+                NativeMethods.RECT trayRect;
+                if (NativeMethods.GetWindowRect(primaryTray, out trayRect) && trayRect.Width > 0 && trayRect.Height > 0) {
+                    ApplyTaskbarVisuals(
+                        primaryTray, _mainTrayState, config, true,
+                        trayRect, _mainTrayState.CachedLeft, _mainTrayState.CachedRight,
+                        _mainTrayState.CachedTop, _mainTrayState.CachedBottom,
+                        _mainTrayState.CachedNotifyLeft, _mainTrayState.CachedNotifyRight,
+                        0);
+                    AnimateDock(primaryTray, _mainTrayState, config, true, show: true);
+                    return;
+                }
+            }
+
+            UpdateSingleTaskbar(primaryTray, _mainTrayState, config, isPrimary: true, initialAlpha: 0);
+            AnimateDock(primaryTray, _mainTrayState, config, true, show: true);
         }
 
         private void HidePrimaryTrayVisuals(IntPtr primaryTray) {
@@ -323,8 +389,82 @@ namespace TaskbarDock {
                    cls == "#32768";
         }
 
-        private bool IsForegroundFullscreenOrMaximized(out bool isShellDockActive) {
+        private static string GetProcessNameSafe(IntPtr hwnd) {
+            try {
+                uint pid;
+                NativeMethods.GetWindowThreadProcessId(hwnd, out pid);
+                if (pid == 0) return "";
+                using (var p = System.Diagnostics.Process.GetProcessById((int)pid)) {
+                    return p.ProcessName ?? "";
+                }
+            } catch {
+                return "";
+            }
+        }
+
+        private static bool IsSearchProcess(string procName) {
+            if (string.IsNullOrEmpty(procName)) return false;
+            return procName.Equals("SearchHost", StringComparison.OrdinalIgnoreCase) ||
+                   procName.Equals("SearchApp", StringComparison.OrdinalIgnoreCase) ||
+                   procName.Equals("SearchUI", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsStartOrSearchProcess(string procName) {
+            if (string.IsNullOrEmpty(procName)) return false;
+            return procName.Equals("StartMenuExperienceHost", StringComparison.OrdinalIgnoreCase) ||
+                   IsSearchProcess(procName) ||
+                   procName.Equals("ShellExperienceHost", StringComparison.OrdinalIgnoreCase) ||
+                   procName.Equals("ShellHost", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private void DetectSearchForeground(out IntPtr searchHwnd) {
+            searchHwnd = IntPtr.Zero;
+            IntPtr fg = NativeMethods.GetForegroundWindow();
+            if (fg != IntPtr.Zero && IsSearchProcess(GetProcessNameSafe(fg))) {
+                searchHwnd = fg;
+            }
+        }
+
+        private void AdjustSearchWindowAboveDock(IntPtr searchHwnd, IntPtr primaryTray, Config config) {
+            try {
+                NativeMethods.RECT sr;
+                if (!NativeMethods.GetWindowRect(searchHwnd, out sr)) return;
+
+                var pb = Screen.PrimaryScreen.Bounds;
+                NativeMethods.RECT trayRect;
+                int dockTop = pb.Bottom - 48 + config.MarginTop;
+                if (NativeMethods.GetWindowRect(primaryTray, out trayRect) && trayRect.Height > 10 && trayRect.Height < 150) {
+                    int topMargin = (_mainTrayState.LastTop > -9000) ? _mainTrayState.LastTop : config.MarginTop;
+                    dockTop = trayRect.Top + topMargin;
+                }
+
+                int targetMaxBottom = dockTop - 10;
+                if (searchHwnd != _lastLoggedSearchHwnd) {
+                    _lastLoggedSearchHwnd = searchHwnd;
+                    Logger.Log(string.Format("Search window detected: rect=[{0},{1},{2},{3}] targetMaxBottom={4}",
+                        sr.Left, sr.Top, sr.Right, sr.Bottom, targetMaxBottom));
+                }
+
+                if (sr.Bottom > targetMaxBottom) {
+                    int shiftY = sr.Bottom - targetMaxBottom;
+                    if (shiftY > 2 && shiftY < 220) {
+                        int newTop = sr.Top - shiftY;
+                        if (sr.Height < pb.Height - 20 && newTop < pb.Top + 8) {
+                            newTop = pb.Top + 8;
+                        }
+                        NativeMethods.SetWindowPos(
+                            searchHwnd, IntPtr.Zero,
+                            sr.Left, newTop, 0, 0,
+                            NativeMethods.SWP_NOSIZE | NativeMethods.SWP_NOZORDER | NativeMethods.SWP_NOACTIVATE);
+                    }
+                }
+            } catch { }
+        }
+
+        private bool IsForegroundFullscreenOrMaximized(IntPtr primaryTray, out bool isShellDockActive, out bool isStartOrSearchOpen, out IntPtr searchHwnd) {
             isShellDockActive = false;
+            isStartOrSearchOpen = false;
+            searchHwnd = IntPtr.Zero;
             IntPtr fg = NativeMethods.GetForegroundWindow();
             if (fg == IntPtr.Zero || fg == NativeMethods.GetDesktopWindow() || fg == NativeMethods.GetShellWindow()) {
                 _lastWindowFullscreen = false;
@@ -347,6 +487,17 @@ namespace TaskbarDock {
 
             if (IsShellOrDockWindow(fg, cls)) {
                 isShellDockActive = true;
+                if (_isFullscreenHidden && (fg == primaryTray || cls == "Xaml_WindowedPopupClass")) {
+                    isStartOrSearchOpen = true;
+                }
+                return _lastWindowFullscreen;
+            }
+
+            string procName = GetProcessNameSafe(fg);
+            if (IsStartOrSearchProcess(procName)) {
+                isShellDockActive = true;
+                isStartOrSearchOpen = true;
+                if (IsSearchProcess(procName)) searchHwnd = fg;
                 return _lastWindowFullscreen;
             }
 
@@ -361,6 +512,7 @@ namespace TaskbarDock {
                     return true;
                 }
                 isShellDockActive = true;
+                isStartOrSearchOpen = true;
                 return _lastWindowFullscreen;
             }
 
@@ -405,7 +557,7 @@ namespace TaskbarDock {
                     StringBuilder sb = new StringBuilder(64);
                     NativeMethods.GetClassName(fg, sb, sb.Capacity);
                     string cls = sb.ToString();
-                    if (!IsShellOrDockWindow(fg, cls) && cls != "Windows.UI.Core.CoreWindow") {
+                    if (!IsShellOrDockWindow(fg, cls) && (cls != "Windows.UI.Core.CoreWindow" || IsStartOrSearchProcess(GetProcessNameSafe(fg)))) {
                         IntPtr prev = NativeMethods.GetWindow(primaryTray, NativeMethods.GW_HWNDPREV);
                         for (int i = 0; i < 25 && prev != IntPtr.Zero; i++) {
                             if (prev == fg) {
@@ -444,12 +596,12 @@ namespace TaskbarDock {
             }
         }
 
-        private void AnimateDock(IntPtr primaryTray, Config config, bool show) {
-            if (!_mainTrayState.IsCustomRgnApplied) return;
-            int rLeft = _mainTrayState.LastLeft;
-            int rRight = _mainTrayState.LastRight;
-            int rTop = _mainTrayState.LastTop;
-            int rBottom = _mainTrayState.LastBottom;
+        private void AnimateDock(IntPtr trayHwnd, TrayState state, Config config, bool isPrimary, bool show) {
+            if (!state.IsCustomRgnApplied) return;
+            int rLeft = state.LastLeft;
+            int rRight = state.LastRight;
+            int rTop = state.LastTop;
+            int rBottom = state.LastBottom;
             int rad = config.CornerRadius * 2;
             int visualMargin = Math.Max(12, config.PaddingHorizontal);
 
@@ -470,7 +622,7 @@ namespace TaskbarDock {
                 byte curAlpha = (byte)Math.Max(0, Math.Min(255, (int)Math.Round(config.TaskbarOpacity * factor)));
 
                 IntPtr rgn = NativeMethods.CreateRoundRectRgn(rLeft, curTop, rRight, rBottom, rad, rad);
-                if (config.ShowQuickSettingsButton) {
+                if (isPrimary && config.ShowQuickSettingsButton) {
                     int btnSize = 26;
                     int bX = rRight - visualMargin - btnSize;
                     int bY = rTop + (rBottom - rTop - btnSize) / 2;
@@ -482,10 +634,10 @@ namespace TaskbarDock {
                     rgn = diffRgn;
                 }
 
-                NativeMethods.SetLayeredWindowAttributes(primaryTray, 0, curAlpha, NativeMethods.LWA_ALPHA);
-                NativeMethods.SetWindowRgn(primaryTray, rgn, true);
+                NativeMethods.SetLayeredWindowAttributes(trayHwnd, 0, curAlpha, NativeMethods.LWA_ALPHA);
+                NativeMethods.SetWindowRgn(trayHwnd, rgn, true);
 
-                if (_overlay != null && !_overlay.IsDisposed && (show || _overlay.Visible)) {
+                if (isPrimary && _overlay != null && !_overlay.IsDisposed && (show || _overlay.Visible)) {
                     double btnOp = factor;
                     int btnOffset = (int)Math.Round(14.0 * (1.0 - factor));
                     try {
@@ -501,20 +653,24 @@ namespace TaskbarDock {
             }
 
             if (show) {
-                NativeMethods.SetLayeredWindowAttributes(primaryTray, 0, (byte)config.TaskbarOpacity, NativeMethods.LWA_ALPHA);
-                _mainTrayState.Reset();
-                UpdateSingleTaskbar(primaryTray, _mainTrayState, config, isPrimary: true);
-                EnsureTaskbarZOrder(primaryTray, config, forceTopMost: false);
-                if (_overlay != null && !_overlay.IsDisposed) {
-                    try {
-                        _overlay.BeginInvoke(new Action(() => {
-                            if (_overlay != null && !_overlay.IsDisposed) {
-                                _overlay.SetButtonOpacity(1.0);
-                                _overlay.SetVerticalOffset(0);
-                                _overlay.EnsureTopMost();
-                            }
-                        }));
-                    } catch { }
+                NativeMethods.SetLayeredWindowAttributes(trayHwnd, 0, (byte)config.TaskbarOpacity, NativeMethods.LWA_ALPHA);
+                state.Reset();
+                UpdateSingleTaskbar(trayHwnd, state, config, isPrimary);
+                if (isPrimary) {
+                    EnsureTaskbarZOrder(trayHwnd, config, forceTopMost: false);
+                    if (_overlay != null && !_overlay.IsDisposed) {
+                        try {
+                            _overlay.BeginInvoke(new Action(() => {
+                                if (_overlay != null && !_overlay.IsDisposed) {
+                                    _overlay.SetButtonOpacity(1.0);
+                                    _overlay.SetVerticalOffset(0);
+                                    _overlay.EnsureTopMost();
+                                }
+                            }));
+                        } catch { }
+                    }
+                } else {
+                    EnsureSecondaryZOrder(trayHwnd, config, forceTopMost: false);
                 }
             }
         }
@@ -550,38 +706,51 @@ namespace TaskbarDock {
 
         private void UpdateWorkArea(bool floatOver, IntPtr primaryTray) {
             try {
-                var pb = Screen.PrimaryScreen.Bounds;
-                NativeMethods.RECT curWork = new NativeMethods.RECT();
-                bool gotWork = NativeMethods.SystemParametersInfo(NativeMethods.SPI_GETWORKAREA, 0, ref curWork, 0);
-
                 if (floatOver) {
-                    bool isFullWork = gotWork &&
-                        curWork.Left <= pb.Left && curWork.Top <= pb.Top &&
-                        curWork.Right >= pb.Right && curWork.Bottom >= pb.Bottom;
+                    long now = Environment.TickCount & 0x7FFFFFFF;
+                    bool firstPass = !_workAreaModified;
+                    long elapsed = (now - _lastWorkAreaEnforceTick) & 0x7FFFFFFF;
+                    if (!firstPass && elapsed < 400) {
+                        // Still check quickly if any screen work area is non-full only every 400ms
+                        return;
+                    }
 
-                    if (!_workAreaModified) {
-                        SaveOriginalWorkArea();
+                    int fallbackTrayH = GetFallbackTrayHeight();
+                    bool anyUpdated = false;
+                    foreach (var screen in Screen.AllScreens) {
+                        var sb = screen.Bounds;
+                        var wa = screen.WorkingArea;
+                        bool isFullWork = (wa.Left <= sb.Left && wa.Top <= sb.Top && wa.Right >= sb.Right && wa.Bottom >= sb.Bottom);
                         if (!isFullWork) {
-                            NativeMethods.RECT area = new NativeMethods.RECT(pb.Left, pb.Top, pb.Right, pb.Bottom);
-                            NativeMethods.SystemParametersInfo(NativeMethods.SPI_SETWORKAREA, 0, ref area, NativeMethods.SPIF_SENDCHANGE);
+                            if (!_originalWorkAreas.ContainsKey(screen.DeviceName)) {
+                                _originalWorkAreas[screen.DeviceName] = new NativeMethods.RECT(wa.Left, wa.Top, wa.Right, wa.Bottom);
+                            }
+                            NativeMethods.RECT area = new NativeMethods.RECT(sb.Left, sb.Top, sb.Right, sb.Bottom);
+                            NativeMethods.SystemParametersInfo(NativeMethods.SPI_SETWORKAREA, 0, ref area, firstPass ? NativeMethods.SPIF_SENDCHANGE : 0);
+                            anyUpdated = true;
+                        } else if (!_originalWorkAreas.ContainsKey(screen.DeviceName)) {
+                            _originalWorkAreas[screen.DeviceName] = new NativeMethods.RECT(sb.Left, sb.Top, sb.Right, sb.Bottom - fallbackTrayH);
                         }
-                        _workAreaModified = true;
-                        _lastWorkAreaEnforceTick = Environment.TickCount & 0x7FFFFFFF;
-                    } else if (!isFullWork) {
-                        long now = Environment.TickCount & 0x7FFFFFFF;
-                        long elapsed = (now - _lastWorkAreaEnforceTick) & 0x7FFFFFFF;
-                        if (elapsed >= 400) {
-                            NativeMethods.RECT area = new NativeMethods.RECT(pb.Left, pb.Top, pb.Right, pb.Bottom);
-                            NativeMethods.SystemParametersInfo(NativeMethods.SPI_SETWORKAREA, 0, ref area, 0);
-                            _lastWorkAreaEnforceTick = now;
-                        }
+                    }
+                    _workAreaModified = true;
+                    if (firstPass || anyUpdated) {
+                        _lastWorkAreaEnforceTick = now;
                     }
                 } else {
                     if (_workAreaModified) {
-                        NativeMethods.SystemParametersInfo(NativeMethods.SPI_SETWORKAREA, 0, ref _originalWorkArea, NativeMethods.SPIF_SENDCHANGE);
-                        _workAreaModified = false;
+                        RestoreAllWorkAreas();
                     }
                 }
+            } catch { }
+        }
+
+        private void RestoreAllWorkAreas() {
+            try {
+                foreach (var kvp in _originalWorkAreas) {
+                    NativeMethods.RECT orig = kvp.Value;
+                    NativeMethods.SystemParametersInfo(NativeMethods.SPI_SETWORKAREA, 0, ref orig, NativeMethods.SPIF_SENDCHANGE);
+                }
+                _workAreaModified = false;
             } catch { }
         }
 
@@ -709,6 +878,12 @@ namespace TaskbarDock {
             }
 
             // 1. Apply Transparent Glass alpha to Taskbar
+            ApplyTaskbarVisuals(trayHwnd, state, config, isPrimary, trayRect, rLeft, rRight, rTop, rBottom, notifyLeft, notifyRight, initialAlpha);
+        }
+
+        private void ApplyTaskbarVisuals(IntPtr trayHwnd, TrayState state, Config config, bool isPrimary,
+            NativeMethods.RECT trayRect, int rLeft, int rRight, int rTop, int rBottom,
+            int notifyLeft, int notifyRight, int initialAlpha) {
             int targetAlpha = (initialAlpha >= 0) ? initialAlpha : config.TaskbarOpacity;
             try {
                 int exStyle = NativeMethods.GetWindowLong(trayHwnd, NativeMethods.GWL_EXSTYLE);
@@ -733,6 +908,7 @@ namespace TaskbarDock {
             }
 
             if (isPrimary && config.ShowQuickSettingsButton) {
+                int visualMargin = Math.Max(12, config.PaddingHorizontal);
                 int btnSize = 26;
                 int bX = rRight - visualMargin - btnSize;
                 int bY = rTop + (rBottom - rTop - btnSize) / 2;
@@ -767,6 +943,7 @@ namespace TaskbarDock {
             state.LastTrayNotifyLeft = notifyLeft;
             state.LastTrayNotifyRight = notifyRight;
             state.IsCustomRgnApplied = true;
+            state.SaveCache();
         }
 
         private void UpdateOverlayPos(int left, int top, int right, int bottom, Config config, double targetOpacity = 1.0) {
@@ -804,6 +981,79 @@ namespace TaskbarDock {
             } catch { }
         }
 
+        private bool HasMaximizedOrFullscreenWindowOnScreen(Screen targetScreen) {
+            bool found = false;
+            string targetDevice = targetScreen.DeviceName;
+            var sbBounds = targetScreen.Bounds;
+
+            NativeMethods.EnumWindows((hwnd, lParam) => {
+                if (!NativeMethods.IsWindowVisible(hwnd) || NativeMethods.IsIconic(hwnd)) return true;
+
+                int cloaked = 0;
+                if (NativeMethods.DwmGetWindowAttribute(hwnd, NativeMethods.DWMWA_CLOAKED, out cloaked, 4) == 0 && cloaked != 0) {
+                    return true;
+                }
+
+                StringBuilder sb = new StringBuilder(64);
+                NativeMethods.GetClassName(hwnd, sb, sb.Capacity);
+                string cls = sb.ToString();
+                if (cls == "Progman" || cls == "WorkerW" || cls == "EdgeUiInputTopWndClass" || IsShellOrDockWindow(hwnd, cls)) {
+                    return true;
+                }
+
+                if (IsStartOrSearchProcess(GetProcessNameSafe(hwnd))) {
+                    return true;
+                }
+
+                NativeMethods.RECT r;
+                if (!NativeMethods.GetWindowRect(hwnd, out r)) return true;
+                if (r.Width < 120 || r.Height < 120) return true;
+
+                try {
+                    if (NativeMethods.IsZoomed(hwnd)) {
+                        if (Screen.FromHandle(hwnd).DeviceName == targetDevice) {
+                            found = true;
+                            return false;
+                        }
+                    } else if (r.Left <= sbBounds.Left && r.Top <= sbBounds.Top &&
+                               r.Right >= sbBounds.Right && r.Bottom >= sbBounds.Bottom - 2) {
+                        if (Screen.FromHandle(hwnd).DeviceName == targetDevice) {
+                            found = true;
+                            return false;
+                        }
+                    }
+                } catch { }
+
+                return true;
+            }, IntPtr.Zero);
+
+            return found;
+        }
+
+        private void RevealSecondaryDockFast(IntPtr secHwnd, TrayState s, Config config) {
+            s.IsFullscreenHidden = false;
+            s.Reset();
+            NativeMethods.SetLayeredWindowAttributes(secHwnd, 0, 0, NativeMethods.LWA_ALPHA);
+            EnsureSecondaryZOrder(secHwnd, config, forceTopMost: true);
+
+            if (s.HasCachedBounds) {
+                NativeMethods.RECT trayRect;
+                if (NativeMethods.GetWindowRect(secHwnd, out trayRect) && trayRect.Width > 0 && trayRect.Height > 0) {
+                    ApplyTaskbarVisuals(
+                        secHwnd, s, config, false,
+                        trayRect, s.CachedLeft, s.CachedRight,
+                        s.CachedTop, s.CachedBottom,
+                        s.CachedNotifyLeft, s.CachedNotifyRight,
+                        0);
+                    AnimateDock(secHwnd, s, config, false, show: true);
+                    return;
+                }
+            }
+
+            UpdateSingleTaskbar(secHwnd, s, config, isPrimary: false, initialAlpha: 0);
+            AnimateDock(secHwnd, s, config, false, show: true);
+        }
+
         private void UpdateSecondaryTaskbars(Config config) {
             List<IntPtr> secondaryList = new List<IntPtr>();
             NativeMethods.EnumWindows((hwnd, lParam) => {
@@ -815,14 +1065,132 @@ namespace TaskbarDock {
                 return true;
             }, IntPtr.Zero);
 
+            bool anySecActive = false;
+            IntPtr fg = NativeMethods.GetForegroundWindow();
+            string fgProc = (fg != IntPtr.Zero) ? GetProcessNameSafe(fg) : "";
+            bool isStartOrSearch = IsStartOrSearchProcess(fgProc);
+
             foreach (IntPtr secHwnd in secondaryList) {
                 TrayState s;
                 if (!_secondaryStates.TryGetValue(secHwnd, out s)) {
                     s = new TrayState();
                     _secondaryStates[secHwnd] = s;
                 }
+
+                if (config.AutoHideInFullscreen) {
+                    Screen secScreen = Screen.FromHandle(secHwnd);
+                    bool secFullOrMax = HasMaximizedOrFullscreenWindowOnScreen(secScreen);
+                    if (secFullOrMax) {
+                        anySecActive = true;
+                        var sb = secScreen.Bounds;
+                        NativeMethods.RECT trayRect;
+                        int trayH = 48;
+                        int dockTop = sb.Bottom - trayH;
+                        if (NativeMethods.GetWindowRect(secHwnd, out trayRect) && trayRect.Height > 10 && trayRect.Height < 150) {
+                            trayH = trayRect.Height;
+                            dockTop = (trayRect.Top > sb.Top && trayRect.Top < sb.Bottom) ? trayRect.Top : (sb.Bottom - trayH);
+                        }
+
+                        long now = Environment.TickCount & 0x7FFFFFFF;
+                        bool startOnThisScreen = false;
+                        if (isStartOrSearch && fg != IntPtr.Zero) {
+                            try {
+                                startOnThisScreen = (Screen.FromHandle(fg).DeviceName == secScreen.DeviceName);
+                            } catch { }
+                        }
+
+                        NativeMethods.POINT pt;
+                        if (startOnThisScreen || fg == secHwnd) {
+                            s.IsHoverRevealed = true;
+                            s.LastInDockZoneTick = now;
+                        } else if (NativeMethods.GetCursorPos(out pt)) {
+                            bool inSecX = (pt.X >= sb.Left && pt.X < sb.Right);
+                            bool atBottomEdge = inSecX && pt.Y >= sb.Bottom - 5 && pt.Y <= sb.Bottom;
+                            bool inDockZone = inSecX && pt.Y >= dockTop - 16 && pt.Y <= sb.Bottom;
+
+                            if (atBottomEdge) {
+                                s.IsHoverRevealed = true;
+                                s.LastInDockZoneTick = now;
+                            } else if (s.IsHoverRevealed && inDockZone) {
+                                s.LastInDockZoneTick = now;
+                            } else if (s.IsHoverRevealed) {
+                                long elapsed = (now - s.LastInDockZoneTick) & 0x7FFFFFFF;
+                                if (elapsed >= 280) {
+                                    s.IsHoverRevealed = false;
+                                }
+                            }
+                        }
+
+                        if (!s.IsHoverRevealed) {
+                            if (!s.IsFullscreenHidden) {
+                                Logger.Log("Hiding secondary dock (fullscreen/maximized window on " + secScreen.DeviceName + ").");
+                                s.SaveCache();
+                                AnimateDock(secHwnd, s, config, false, show: false);
+                                HidePrimaryTrayVisuals(secHwnd);
+                                s.IsFullscreenHidden = true;
+                            }
+                            continue;
+                        } else if (s.IsFullscreenHidden) {
+                            Logger.Log("Revealing secondary dock on " + secScreen.DeviceName + ".");
+                            RevealSecondaryDockFast(secHwnd, s, config);
+                        }
+                    } else {
+                        s.IsHoverRevealed = false;
+                        if (s.IsFullscreenHidden) {
+                            Logger.Log("Restoring secondary dock on " + secScreen.DeviceName + ".");
+                            RevealSecondaryDockFast(secHwnd, s, config);
+                        }
+                    }
+                } else {
+                    s.IsHoverRevealed = false;
+                    if (s.IsFullscreenHidden) {
+                        RevealSecondaryDockFast(secHwnd, s, config);
+                    }
+                }
+
+                EnsureSecondaryZOrder(secHwnd, config, forceTopMost: false);
                 UpdateSingleTaskbar(secHwnd, s, config, isPrimary: false);
             }
+
+            _anySecondaryFullscreenOrHover = anySecActive;
+        }
+
+        private void EnsureSecondaryZOrder(IntPtr secHwnd, Config config, bool forceTopMost) {
+            try {
+                int trayEx = NativeMethods.GetWindowLong(secHwnd, NativeMethods.GWL_EXSTYLE);
+                bool isTrayTopMost = (trayEx & NativeMethods.WS_EX_TOPMOST) != 0;
+
+                if (!config.FloatOverWindows) {
+                    if (isTrayTopMost) {
+                        NativeMethods.SetWindowPos(secHwnd, NativeMethods.HWND_NOTOPMOST, 0, 0, 0, 0, NativeMethods.SWP_NOMOVE | NativeMethods.SWP_NOSIZE | NativeMethods.SWP_NOACTIVATE);
+                    }
+                    return;
+                }
+
+                bool needTopMost = forceTopMost || !isTrayTopMost;
+                if (!needTopMost) {
+                    IntPtr fg = NativeMethods.GetForegroundWindow();
+                    if (fg != IntPtr.Zero && fg != secHwnd) {
+                        StringBuilder sb = new StringBuilder(64);
+                        NativeMethods.GetClassName(fg, sb, sb.Capacity);
+                        string cls = sb.ToString();
+                        if (!IsShellOrDockWindow(fg, cls) && (cls != "Windows.UI.Core.CoreWindow" || IsStartOrSearchProcess(GetProcessNameSafe(fg)))) {
+                            IntPtr prev = NativeMethods.GetWindow(secHwnd, NativeMethods.GW_HWNDPREV);
+                            for (int i = 0; i < 25 && prev != IntPtr.Zero; i++) {
+                                if (prev == fg) {
+                                    needTopMost = true;
+                                    break;
+                                }
+                                prev = NativeMethods.GetWindow(prev, NativeMethods.GW_HWNDPREV);
+                            }
+                        }
+                    }
+                }
+
+                if (needTopMost) {
+                    NativeMethods.SetWindowPos(secHwnd, NativeMethods.HWND_TOPMOST, 0, 0, 0, 0, NativeMethods.SWP_NOMOVE | NativeMethods.SWP_NOSIZE | NativeMethods.SWP_NOACTIVATE);
+                }
+            } catch { }
         }
 
         public void RestoreAll() {
@@ -842,10 +1210,7 @@ namespace TaskbarDock {
 
             // Restore original work area
             if (_workAreaModified) {
-                try {
-                    NativeMethods.SystemParametersInfo(NativeMethods.SPI_SETWORKAREA, 0, ref _originalWorkArea, NativeMethods.SPIF_SENDCHANGE);
-                    _workAreaModified = false;
-                } catch { }
+                RestoreAllWorkAreas();
             }
 
             NativeMethods.EnumWindows((hwnd, lParam) => {
@@ -860,8 +1225,11 @@ namespace TaskbarDock {
             }, IntPtr.Zero);
 
             foreach (var kvp in _secondaryStates) {
+                kvp.Value.IsFullscreenHidden = false;
+                kvp.Value.IsHoverRevealed = false;
                 kvp.Value.Reset();
             }
+            _anySecondaryFullscreenOrHover = false;
         }
     }
 }

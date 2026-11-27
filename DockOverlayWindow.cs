@@ -113,6 +113,8 @@ namespace TaskbarDock {
         }
 
         public void UpdateOverlay(int left, int top, int right, int bottom, Config config, double targetOpacity = 1.0) {
+            bool anchorChanged = (_dockLeft != left || _dockTop != top || _dockRight != right || _dockBottom != bottom ||
+                                  _config == null || _config.TaskbarOpacity != config.TaskbarOpacity || _config.CornerRadius != config.CornerRadius);
             _config = config;
             if (!_config.ShowQuickSettingsButton || !_config.Enabled) {
                 HideTrayBar();
@@ -128,27 +130,30 @@ namespace TaskbarDock {
             int visualMargin = Math.Max(12, _config.PaddingHorizontal);
             int btnX = right - visualMargin - BtnSize;
             int btnY = top + (bottom - top - BtnSize) / 2;
+            bool posChanged = (_baseBtnX != btnX || _baseBtnY != btnY || Math.Abs(this.Opacity - Math.Max(0.0, Math.Min(1.0, targetOpacity))) > 0.01);
             _baseBtnX = btnX;
             _baseBtnY = btnY;
 
-            this.Location = new Point(btnX, btnY);
-            this.Size = new Size(BtnSize, BtnSize);
-            this.Opacity = Math.Max(0.0, Math.Min(1.0, targetOpacity));
+            if (posChanged || !this.Visible) {
+                this.Location = new Point(btnX, btnY);
+                this.Size = new Size(BtnSize, BtnSize);
+                this.Opacity = Math.Max(0.0, Math.Min(1.0, targetOpacity));
 
-            if (!_regionSet) {
-                IntPtr rgn = NativeMethods.CreateRoundRectRgn(0, 0, BtnSize + 1, BtnSize + 1, BtnSize + 1, BtnSize + 1);
-                NativeMethods.SetWindowRgn(this.Handle, rgn, true);
-                _regionSet = true;
+                if (!_regionSet) {
+                    IntPtr rgn = NativeMethods.CreateRoundRectRgn(0, 0, BtnSize + 1, BtnSize + 1, BtnSize + 1, BtnSize + 1);
+                    NativeMethods.SetWindowRgn(this.Handle, rgn, true);
+                    _regionSet = true;
+                }
+
+                if (!this.Visible) {
+                    this.Show();
+                }
+
+                NativeMethods.SetWindowPos(this.Handle, NativeMethods.HWND_TOPMOST, btnX, btnY, BtnSize, BtnSize, NativeMethods.SWP_NOACTIVATE | NativeMethods.SWP_SHOWWINDOW);
+                this.Invalidate();
             }
 
-            if (!this.Visible) {
-                this.Show();
-            }
-
-            NativeMethods.SetWindowPos(this.Handle, NativeMethods.HWND_TOPMOST, btnX, btnY, BtnSize, BtnSize, NativeMethods.SWP_NOACTIVATE | NativeMethods.SWP_SHOWWINDOW);
-            this.Invalidate();
-
-            if (_trayBar != null && _trayBar.IsOpenVolatile && _wpfDispatcher != null) {
+            if (anchorChanged && _trayBar != null && _trayBar.IsOpenVolatile && _wpfDispatcher != null) {
                 int dl = _dockLeft, dt = _dockTop, dr = _dockRight, db = _dockBottom;
                 Config cfg = _config;
                 _wpfDispatcher.BeginInvoke(new Action(() => {

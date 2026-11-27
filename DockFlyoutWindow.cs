@@ -40,6 +40,9 @@ namespace TaskbarDock {
         private DispatcherTimer _clockTimer;
         private IntPtr _hwnd = IntPtr.Zero;
         private bool _isClosingAnim = false;
+        private int _animGen = 0;
+        private int _targetLeft = 0;
+        private int _targetTop = 0;
 
         // Cached Wi-Fi list so opening is instant without height jump
         private List<WifiNetworkInfo> _cachedWifi = new List<WifiNetworkInfo>();
@@ -78,7 +81,7 @@ namespace TaskbarDock {
             TextOptions.SetTextFormattingMode(this, TextFormattingMode.Display);
             TextOptions.SetTextRenderingMode(this, TextRenderingMode.Auto);
 
-            _slideTransform = new TranslateTransform(0, 8);
+            _slideTransform = new TranslateTransform(0, 0);
             _contentHost = new StackPanel { Orientation = Orientation.Vertical };
             _rootBorder = new Border {
                 Child = _contentHost,
@@ -144,26 +147,51 @@ namespace TaskbarDock {
             BuildContent(activeLangCode ?? "RUS");
 
             this.UpdateLayout();
-            PositionAboveAnchor();
+            ComputeAnchorPosition(out _targetLeft, out _targetTop);
 
             if (!this.IsVisible) {
-                this.Opacity = 0;
-                _slideTransform.Y = 7;
+                int gen = Interlocked.Increment(ref _animGen);
+                _rootBorder.BeginAnimation(UIElement.OpacityProperty, null);
+                _slideTransform.BeginAnimation(TranslateTransform.YProperty, null);
+                this.BeginAnimation(Window.OpacityProperty, null);
+                this.Opacity = 1.0;
+                _rootBorder.Opacity = 1.0;
+                _slideTransform.Y = 0;
+                _rootBorder.IsHitTestVisible = false;
+
+                this.Left = -30000;
+                this.Top = -30000;
                 this.Show();
-                PositionAboveAnchor();
+                NativeMethods.SetForegroundWindow(_hwnd);
+                this.Activate();
 
-                var fade = new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(150)) {
-                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
-                };
-                var slide = new DoubleAnimation(7, 0, TimeSpan.FromMilliseconds(160)) {
-                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
-                };
-                this.BeginAnimation(Window.OpacityProperty, fade);
-                _slideTransform.BeginAnimation(TranslateTransform.YProperty, slide);
+                this.Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() => {
+                    if (!this.IsVisible || _isClosingAnim || Volatile.Read(ref _animGen) != gen) return;
+
+                    int startY = _targetTop + 8;
+                    var ptStart = new NativeMethods.POINT(_targetLeft, startY);
+                    var bfStart = new NativeMethods.BLENDFUNCTION {
+                        BlendOp = NativeMethods.AC_SRC_OVER,
+                        BlendFlags = 0,
+                        SourceConstantAlpha = 0,
+                        AlphaFormat = NativeMethods.AC_SRC_ALPHA
+                    };
+                    NativeMethods.UpdateLayeredWindow(_hwnd, IntPtr.Zero, ref ptStart, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0, ref bfStart, NativeMethods.ULW_ALPHA);
+
+                    RunUlwAnimation(gen, _targetLeft, startY, _targetTop, 0, 255, 150, easeOut: true, onCompleted: () => {
+                        if (!this.IsVisible || _isClosingAnim) return;
+                        this.Left = _targetLeft;
+                        this.Top = _targetTop;
+                        _rootBorder.IsHitTestVisible = true;
+                    });
+                }));
+            } else {
+                this.Left = _targetLeft;
+                this.Top = _targetTop;
+                _rootBorder.IsHitTestVisible = true;
+                NativeMethods.SetForegroundWindow(_hwnd);
+                this.Activate();
             }
-
-            NativeMethods.SetForegroundWindow(_hwnd);
-            this.Activate();
 
             if (kind == FlyoutKind.Calendar) _clockTimer.Start();
             else _clockTimer.Stop();
@@ -171,7 +199,45 @@ namespace TaskbarDock {
             if (kind == FlyoutKind.Network) RefreshWifiAsync();
         }
 
+        private void RunUlwAnimation(int gen, int x, int fromY, int toY, byte fromAlpha, byte toAlpha, int durationMs, bool easeOut, Action onCompleted) {
+            IntPtr hwnd = _hwnd;
+            Thread t = new Thread(() => {
+                NativeMethods.timeBeginPeriod(1);
+                try {
+                    var sw = Stopwatch.StartNew();
+                    var bf = new NativeMethods.BLENDFUNCTION {
+                        BlendOp = NativeMethods.AC_SRC_OVER,
+                        BlendFlags = 0,
+                        SourceConstantAlpha = fromAlpha,
+                        AlphaFormat = NativeMethods.AC_SRC_ALPHA
+                    };
+                    while (true) {
+                        if (Volatile.Read(ref _animGen) != gen) return;
+                        double p = Math.Min(1.0, sw.Elapsed.TotalMilliseconds / durationMs);
+                        double eased = easeOut ? (1.0 - Math.Pow(1.0 - p, 3.0)) : Math.Pow(p, 2.0);
+                        int curY = fromY + (int)Math.Round((toY - fromY) * eased);
+                        int curA = fromAlpha + (int)Math.Round((toAlpha - fromAlpha) * eased);
+                        bf.SourceConstantAlpha = (byte)Math.Max(0, Math.Min(255, curA));
+                        var pt = new NativeMethods.POINT(x, curY);
+                        NativeMethods.UpdateLayeredWindow(hwnd, IntPtr.Zero, ref pt, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0, ref bf, NativeMethods.ULW_ALPHA);
+                        if (p >= 1.0) break;
+                        Thread.Sleep(5);
+                    }
+                    if (Volatile.Read(ref _animGen) == gen && onCompleted != null && !this.Dispatcher.HasShutdownStarted) {
+                        this.Dispatcher.BeginInvoke(onCompleted);
+                    }
+                } catch {
+                } finally {
+                    NativeMethods.timeEndPeriod(1);
+                }
+            });
+            t.IsBackground = true;
+            t.Name = "FlyoutUlwAnim";
+            t.Start();
+        }
+
         public void HideFlyout(bool animate) {
+            int gen = Interlocked.Increment(ref _animGen);
             _clockTimer.Stop();
             _draggingVol = false;
             if (!this.IsVisible) {
@@ -181,28 +247,21 @@ namespace TaskbarDock {
             if (!animate) {
                 _isClosingAnim = false;
                 _kind = FlyoutKind.None;
-                this.BeginAnimation(Window.OpacityProperty, null);
-                _slideTransform.BeginAnimation(TranslateTransform.YProperty, null);
+                _rootBorder.IsHitTestVisible = true;
                 this.Hide();
                 return;
             }
             if (_isClosingAnim) return;
             _isClosingAnim = true;
-            var fade = new DoubleAnimation(this.Opacity, 0, TimeSpan.FromMilliseconds(100)) {
-                EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseIn }
-            };
-            var slide = new DoubleAnimation(0, 5, TimeSpan.FromMilliseconds(100)) {
-                EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseIn }
-            };
-            fade.Completed += (s, e) => {
+            _rootBorder.IsHitTestVisible = false;
+            RunUlwAnimation(gen, _targetLeft, _targetTop, _targetTop + 5, 255, 0, 100, easeOut: false, onCompleted: () => {
                 if (_isClosingAnim) {
                     _isClosingAnim = false;
                     _kind = FlyoutKind.None;
+                    _rootBorder.IsHitTestVisible = true;
                     this.Hide();
                 }
-            };
-            this.BeginAnimation(Window.OpacityProperty, fade);
-            _slideTransform.BeginAnimation(TranslateTransform.YProperty, slide);
+            });
         }
 
         private void ApplyDockTheme() {
@@ -213,7 +272,7 @@ namespace TaskbarDock {
             _rootBorder.CornerRadius = new CornerRadius(radius);
         }
 
-        private void PositionAboveAnchor() {
+        private void ComputeAnchorPosition(out int outLeft, out int outTop) {
             this.UpdateLayout();
             double w = this.ActualWidth > 0 ? this.ActualWidth : this.DesiredSize.Width;
             double h = this.ActualHeight > 0 ? this.ActualHeight : this.DesiredSize.Height;
@@ -226,8 +285,14 @@ namespace TaskbarDock {
             double top = _anchorBottomY - h;
             if (top < pb.Top + 8) top = pb.Top + 8;
 
-            this.Left = Math.Round(left);
-            this.Top = Math.Round(top);
+            outLeft = (int)Math.Round(left);
+            outTop = (int)Math.Round(top);
+        }
+
+        private void PositionAboveAnchor() {
+            ComputeAnchorPosition(out _targetLeft, out _targetTop);
+            this.Left = _targetLeft;
+            this.Top = _targetTop;
         }
 
         private void BuildContent(string activeLangCode) {

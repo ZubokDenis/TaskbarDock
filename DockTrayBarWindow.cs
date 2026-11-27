@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.Threading;
 using System.Windows;
@@ -65,17 +66,24 @@ namespace TaskbarDock {
 
         private DispatcherTimer _clockTimer;
         private DispatcherTimer _overflowMonitorTimer;
+        private DispatcherTimer _delayedRefreshTimer;
         private IntPtr _hwnd = IntPtr.Zero;
         private IntPtr _prevForegroundHwnd = IntPtr.Zero;
         private long _keepOpenForTrayOverflowUntil = 0;
         private long _lastClosedTick = 0;
         private bool _isClosingAnim = false;
+        private int _animGen = 0;
         private int _refreshSeq = 0;
+        private int _targetLeft = 0;
+        private int _targetTop = 0;
 
         private int _dockLeft;
         private int _dockTop;
         private int _dockRight;
         private int _dockBottom;
+        private bool _stripBuilt = false;
+        private int _lastThemeAlpha = -1;
+        private double _lastThemeRadius = -1;
 
         public volatile bool IsOpenVolatile = false;
         public volatile IntPtr HwndVolatile = IntPtr.Zero;
@@ -99,7 +107,7 @@ namespace TaskbarDock {
             TextOptions.SetTextFormattingMode(this, TextFormattingMode.Display);
             TextOptions.SetTextRenderingMode(this, TextRenderingMode.Auto);
 
-            _slideTransform = new TranslateTransform(0, 7);
+            _slideTransform = new TranslateTransform(0, 0);
             _itemsHost = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
             _rootBorder = new Border {
                 Child = _itemsHost,
@@ -122,6 +130,22 @@ namespace TaskbarDock {
                 }
             };
 
+            _delayedRefreshTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(260) };
+            _delayedRefreshTimer.Tick += (s, e) => {
+                _delayedRefreshTimer.Stop();
+                if (this.IsVisible && !_isClosingAnim) {
+                    ThreadPool.QueueUserWorkItem(_ => {
+                        ReadLocalAudioAndLang();
+                        if (!this.Dispatcher.HasShutdownStarted) {
+                            this.Dispatcher.BeginInvoke(new Action(() => {
+                                if (this.IsVisible && !_isClosingAnim) UpdateLiveVisuals();
+                            }));
+                        }
+                    });
+                    RefreshTraySnapshotAsync(rebuildLayout: false);
+                }
+            };
+
             _overflowMonitorTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
             _overflowMonitorTimer.Tick += (s, e) => {
                 if (!this.IsVisible) {
@@ -133,7 +157,15 @@ namespace TaskbarDock {
                 if (IsAnyOverflowWindowVisible()) return;
                 _overflowMonitorTimer.Stop();
                 IntPtr fg = NativeMethods.GetForegroundWindow();
-                if (fg != _hwnd && (_flyout == null || fg != _flyout.Hwnd)) {
+                NativeMethods.POINT pt;
+                bool cursorInBar = NativeMethods.GetCursorPos(out pt) &&
+                    pt.X >= this.Left && pt.X <= this.Left + this.ActualWidth &&
+                    pt.Y >= this.Top && pt.Y <= this.Top + this.ActualHeight;
+                bool fgIsTray = (fg == NativeMethods.FindWindow("Shell_TrayWnd", null));
+                if (fg == _hwnd || (_flyout != null && fg == _flyout.Hwnd) || cursorInBar || fgIsTray) {
+                    NativeMethods.SetForegroundWindow(_hwnd);
+                    this.Activate();
+                } else {
                     HideBar(immediate: true);
                 }
             };
@@ -165,6 +197,19 @@ namespace TaskbarDock {
             ReadLocalAudioAndLang();
             ApplyDockTheme();
             BuildStripItems();
+            _stripBuilt = true;
+            UpdateLiveVisuals();
+
+            // Pre-warm WPF layered surface and DirectWrite glyph cache offscreen without stealing focus
+            bool prevShowAct = this.ShowActivated;
+            this.ShowActivated = false;
+            this.Left = -30000;
+            this.Top = -30000;
+            this.Show();
+            this.Dispatcher.Invoke(new Action(() => { }), DispatcherPriority.Render);
+            this.Hide();
+            this.ShowActivated = prevShowAct;
+
             RefreshTraySnapshotAsync(rebuildLayout: false);
         }
 
@@ -210,39 +255,109 @@ namespace TaskbarDock {
             }
 
             ReadForegroundInputLanguage();
-            ReadLocalAudioAndLang();
             ApplyDockTheme();
-            BuildStripItems();
+            if (!_stripBuilt) {
+                ReadLocalAudioAndLang();
+                BuildStripItems();
+                _stripBuilt = true;
+            }
             UpdateLiveVisuals();
 
             this.UpdateLayout();
-            PositionAboveDock();
+            ComputeTargetPosition(out _targetLeft, out _targetTop);
 
             IsOpenVolatile = true;
             if (!this.IsVisible) {
-                this.Opacity = 0;
-                _slideTransform.Y = 7;
-                this.Show();
-                PositionAboveDock();
+                int gen = Interlocked.Increment(ref _animGen);
+                _clockTimer.Stop();
+                _rootBorder.BeginAnimation(UIElement.OpacityProperty, null);
+                _slideTransform.BeginAnimation(TranslateTransform.YProperty, null);
+                this.BeginAnimation(Window.OpacityProperty, null);
+                this.Opacity = 1.0;
+                _rootBorder.Opacity = 1.0;
+                _slideTransform.Y = 0;
+                _rootBorder.IsHitTestVisible = false;
 
-                var fade = new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(150)) {
-                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
-                };
-                var slide = new DoubleAnimation(7, 0, TimeSpan.FromMilliseconds(170)) {
-                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
-                };
-                this.BeginAnimation(Window.OpacityProperty, fade);
-                _slideTransform.BeginAnimation(TranslateTransform.YProperty, slide);
+                // Render crisp bitmap offscreen first; wait until Background priority so Show/Activate/Render fully settle before moving on-screen
+                this.Left = -30000;
+                this.Top = -30000;
+                this.Show();
+                NativeMethods.SetForegroundWindow(_hwnd);
+                this.Activate();
+
+                this.Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() => {
+                    if (!this.IsVisible || _isClosingAnim || Volatile.Read(ref _animGen) != gen) return;
+
+                    int startY = _targetTop + 10;
+                    var ptStart = new NativeMethods.POINT(_targetLeft, startY);
+                    var bfStart = new NativeMethods.BLENDFUNCTION {
+                        BlendOp = NativeMethods.AC_SRC_OVER,
+                        BlendFlags = 0,
+                        SourceConstantAlpha = 0,
+                        AlphaFormat = NativeMethods.AC_SRC_ALPHA
+                    };
+                    NativeMethods.UpdateLayeredWindow(_hwnd, IntPtr.Zero, ref ptStart, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0, ref bfStart, NativeMethods.ULW_ALPHA);
+
+                    RunUlwAnimation(gen, _targetLeft, startY, _targetTop, 0, 255, 165, easeOut: true, onCompleted: () => {
+                        if (!this.IsVisible || _isClosingAnim) return;
+                        this.Left = _targetLeft;
+                        this.Top = _targetTop;
+                        _rootBorder.IsHitTestVisible = true;
+                        _clockTimer.Start();
+                    });
+                }));
+            } else {
+                this.Left = _targetLeft;
+                this.Top = _targetTop;
+                _rootBorder.IsHitTestVisible = true;
+                NativeMethods.SetForegroundWindow(_hwnd);
+                this.Activate();
+                _clockTimer.Start();
             }
 
-            NativeMethods.SetForegroundWindow(_hwnd);
-            this.Activate();
+            _delayedRefreshTimer.Stop();
+            _delayedRefreshTimer.Start();
+        }
 
-            _clockTimer.Start();
-            RefreshTraySnapshotAsync(rebuildLayout: false);
+        private void RunUlwAnimation(int gen, int x, int fromY, int toY, byte fromAlpha, byte toAlpha, int durationMs, bool easeOut, Action onCompleted) {
+            IntPtr hwnd = _hwnd;
+            Thread t = new Thread(() => {
+                NativeMethods.timeBeginPeriod(1);
+                try {
+                    var sw = Stopwatch.StartNew();
+                    var bf = new NativeMethods.BLENDFUNCTION {
+                        BlendOp = NativeMethods.AC_SRC_OVER,
+                        BlendFlags = 0,
+                        SourceConstantAlpha = fromAlpha,
+                        AlphaFormat = NativeMethods.AC_SRC_ALPHA
+                    };
+                    while (true) {
+                        if (Volatile.Read(ref _animGen) != gen) return;
+                        double p = Math.Min(1.0, sw.Elapsed.TotalMilliseconds / durationMs);
+                        double eased = easeOut ? (1.0 - Math.Pow(1.0 - p, 3.0)) : Math.Pow(p, 2.0);
+                        int curY = fromY + (int)Math.Round((toY - fromY) * eased);
+                        int curA = fromAlpha + (int)Math.Round((toAlpha - fromAlpha) * eased);
+                        bf.SourceConstantAlpha = (byte)Math.Max(0, Math.Min(255, curA));
+                        var pt = new NativeMethods.POINT(x, curY);
+                        NativeMethods.UpdateLayeredWindow(hwnd, IntPtr.Zero, ref pt, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0, ref bf, NativeMethods.ULW_ALPHA);
+                        if (p >= 1.0) break;
+                        Thread.Sleep(5);
+                    }
+                    if (Volatile.Read(ref _animGen) == gen && onCompleted != null && !this.Dispatcher.HasShutdownStarted) {
+                        this.Dispatcher.BeginInvoke(onCompleted);
+                    }
+                } catch {
+                } finally {
+                    NativeMethods.timeEndPeriod(1);
+                }
+            });
+            t.IsBackground = true;
+            t.Name = "TrayBarUlwAnim";
+            t.Start();
         }
 
         public void UpdateDockAnchor(int dockLeft, int dockTop, int dockRight, int dockBottom, Config config) {
+            bool posChanged = (_dockLeft != dockLeft || _dockTop != dockTop || _dockRight != dockRight || _dockBottom != dockBottom);
             _config = config ?? _config;
             _dockLeft = dockLeft;
             _dockTop = dockTop;
@@ -250,11 +365,17 @@ namespace TaskbarDock {
             _dockBottom = dockBottom;
             if (this.IsVisible && !_isClosingAnim) {
                 ApplyDockTheme();
-                PositionAboveDock();
+                if (posChanged) {
+                    ComputeTargetPosition(out _targetLeft, out _targetTop);
+                    this.Left = _targetLeft;
+                    this.Top = _targetTop;
+                }
             }
         }
 
         public void HideBar(bool immediate) {
+            int gen = Interlocked.Increment(ref _animGen);
+            _delayedRefreshTimer.Stop();
             if (_flyout != null) _flyout.HideFlyout(animate: false);
             _overflowMonitorTimer.Stop();
             _clockTimer.Stop();
@@ -269,40 +390,36 @@ namespace TaskbarDock {
             if (immediate) {
                 _isClosingAnim = false;
                 IsOpenVolatile = false;
-                this.BeginAnimation(Window.OpacityProperty, null);
-                _slideTransform.BeginAnimation(TranslateTransform.YProperty, null);
+                _rootBorder.IsHitTestVisible = true;
                 this.Hide();
                 return;
             }
 
             if (_isClosingAnim) return;
             _isClosingAnim = true;
-            var fade = new DoubleAnimation(this.Opacity, 0, TimeSpan.FromMilliseconds(110)) {
-                EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseIn }
-            };
-            var slide = new DoubleAnimation(0, 5, TimeSpan.FromMilliseconds(110)) {
-                EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseIn }
-            };
-            fade.Completed += (s, e) => {
+            _rootBorder.IsHitTestVisible = false;
+            RunUlwAnimation(gen, _targetLeft, _targetTop, _targetTop + 6, 255, 0, 110, easeOut: false, onCompleted: () => {
                 if (_isClosingAnim) {
                     _isClosingAnim = false;
                     IsOpenVolatile = false;
+                    _rootBorder.IsHitTestVisible = true;
                     this.Hide();
                 }
-            };
-            this.BeginAnimation(Window.OpacityProperty, fade);
-            _slideTransform.BeginAnimation(TranslateTransform.YProperty, slide);
+            });
         }
 
         private void ApplyDockTheme() {
             byte bgAlpha = (_config != null) ? (byte)Math.Max(140, Math.Min(255, _config.TaskbarOpacity)) : (byte)235;
             double radius = (_config != null) ? Math.Min(20.0, Math.Max(4.0, _config.CornerRadius)) : 16.0;
+            if (_lastThemeAlpha == bgAlpha && Math.Abs(_lastThemeRadius - radius) < 0.01) return;
+            _lastThemeAlpha = bgAlpha;
+            _lastThemeRadius = radius;
             _rootBorder.Background = new SolidColorBrush(Color.FromArgb(bgAlpha, 24, 24, 26));
             _rootBorder.BorderBrush = new SolidColorBrush(Color.FromArgb(30, 255, 255, 255));
             _rootBorder.CornerRadius = new CornerRadius(radius);
         }
 
-        private void PositionAboveDock() {
+        private void ComputeTargetPosition(out int outLeft, out int outTop) {
             this.UpdateLayout();
             double w = this.ActualWidth > 0 ? this.ActualWidth : this.DesiredSize.Width;
             double h = 40;
@@ -316,8 +433,8 @@ namespace TaskbarDock {
             double dockTop = (_dockTop > 0) ? _dockTop : (pb.Bottom - 48);
             double top = dockTop - 10 - h;
 
-            this.Left = Math.Round(left);
-            this.Top = Math.Round(top);
+            outLeft = (int)Math.Round(left);
+            outTop = (int)Math.Round(top);
         }
 
         private void BuildStripItems() {
@@ -602,9 +719,15 @@ namespace TaskbarDock {
         private void HandleOverflowClick() {
             if (_flyout != null) _flyout.HideFlyout(animate: false);
 
-            long now = Environment.TickCount & 0x7FFFFFFF;
-            _keepOpenForTrayOverflowUntil = now + 900;
-            _overflowMonitorTimer.Start();
+            bool wasOpen = IsAnyOverflowWindowVisible();
+            if (wasOpen) {
+                _overflowMonitorTimer.Stop();
+                _keepOpenForTrayOverflowUntil = 0;
+            } else {
+                long now = Environment.TickCount & 0x7FFFFFFF;
+                _keepOpenForTrayOverflowUntil = now + 900;
+                _overflowMonitorTimer.Start();
+            }
 
             int centerX = (int)Math.Round(this.Left + 22);
             if (_overflowTile != null) {
@@ -615,7 +738,6 @@ namespace TaskbarDock {
             string exactName;
             lock (_snapLock) { exactName = _snapshot.OverflowName; }
 
-            bool wasOpen = IsAnyOverflowWindowVisible();
             Thread t = new Thread(() => {
                 IntPtr hiddenOverflow = IntPtr.Zero;
                 try {
@@ -636,6 +758,16 @@ namespace TaskbarDock {
 
                     if (!wasOpen) {
                         RepositionAndRevealOverflow(hiddenOverflow, centerX, anchorBottomY);
+                    } else {
+                        Thread.Sleep(40);
+                        if (!this.Dispatcher.HasShutdownStarted) {
+                            this.Dispatcher.BeginInvoke(new Action(() => {
+                                if (this.IsVisible && !_isClosingAnim) {
+                                    NativeMethods.SetForegroundWindow(_hwnd);
+                                    this.Activate();
+                                }
+                            }));
+                        }
                     }
                 } catch {
                 } finally {
